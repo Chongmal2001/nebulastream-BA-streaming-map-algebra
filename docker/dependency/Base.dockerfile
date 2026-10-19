@@ -29,6 +29,10 @@ RUN apt update -y && apt install \
     pkg-config \
     -y
 
+# install GDAL
+RUN apt update -y && apt install -y \
+    libgdal-dev
+
 # install llvm based toolchain
 RUN curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /etc/apt/keyrings/llvm-snapshot.gpg \
     && chmod a+r /etc/apt/keyrings/llvm-snapshot.gpg \

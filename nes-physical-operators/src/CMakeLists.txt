@@ -28,6 +28,8 @@ add_source_files(nes-physical-operators
         WindowProbePhysicalOperator.cpp)
 
 add_subdirectory(Aggregation)
+# focal extension
+add_subdirectory(Focal)
 add_subdirectory(Watermark)
 add_subdirectory(Join)
 add_subdirectory(SliceStore)

@@ -250,4 +250,32 @@ LogicalPlan LogicalPlanBuilder::addBinaryOperatorAndUpdateSource(
     auto newRootOperators = std::ranges::views::join(std::array{leftLogicalPlan.getRootOperators(), rightLogicalPlan.getRootOperators()});
     return promoteOperatorToRoot(leftLogicalPlan.withRootOperators(newRootOperators | std::ranges::to<std::vector>()), operatorNode);
 }
+
+LogicalPlan LogicalPlanBuilder::addWindowedFocal(
+    LogicalPlan queryPlan,
+    const Windowing::TimeBasedWindowType& windowType,
+    Windowing::TimeCharacteristic timeCharacteristic,
+    FocalParameters params,
+    Identifier payloadField)
+{
+    PRECONDITION(not queryPlan.getRootOperators().empty(), "invalid query plan, as the root operator is empty");
+
+
+    queryPlan = checkAndAddWatermarkAssigner(queryPlan, timeCharacteristic);
+
+    /// tileX / tileY are resolved by naming convention (validated in inferLocalSchema)
+    /// only the payload field is user-chosen (arg 0)
+    auto tileXField = Identifier::parse("tileX");
+    auto tileYField = Identifier::parse("tileY");
+
+    return promoteOperatorToRoot(
+        queryPlan,
+        WindowedFocalLogicalOperator::create(
+            std::move(tileXField),
+            std::move(tileYField),
+            std::move(payloadField),
+            std::move(params),
+            windowType,
+            std::move(timeCharacteristic)));
+}
 }

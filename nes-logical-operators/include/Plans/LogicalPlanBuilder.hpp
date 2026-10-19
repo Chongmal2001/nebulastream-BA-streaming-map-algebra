@@ -32,6 +32,7 @@
 #include <Operators/Windows/Aggregations/WindowAggregationLogicalFunction.hpp>
 #include <Operators/Windows/JoinLogicalOperator.hpp>
 #include <Operators/Windows/WindowedAggregationLogicalOperator.hpp>
+#include <Operators/Windows/WindowedFocalLogicalOperator.hpp>
 #include <Plans/LogicalPlan.hpp>
 #include <WindowTypes/Measures/TimeCharacteristic.hpp>
 #include <WindowTypes/Types/TimeBasedWindowType.hpp>
@@ -108,6 +109,13 @@ public:
     /// Checks in case a window is contained in the query.
     /// If a watermark operator exists in the queryPlan and if not adds a watermark strategy to the queryPlan.
     static LogicalPlan checkAndAddWatermarkAssigner(LogicalPlan queryPlan, const Windowing::TimeCharacteristic& timeCharacteristic);
+
+    static LogicalPlan addWindowedFocal(
+        LogicalPlan queryPlan,
+        const Windowing::TimeBasedWindowType& windowType,
+        Windowing::TimeCharacteristic timeCharacteristic,
+        FocalParameters params,
+        Identifier payloadField);
 
 private:
     /// @brief: This method adds a binary operator to the query plan and updates the consumed sources

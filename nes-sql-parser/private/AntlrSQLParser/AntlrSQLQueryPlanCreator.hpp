@@ -86,6 +86,9 @@ public:
     void exitConstantDefault(AntlrSQLParser::ConstantDefaultContext* context) override;
     void exitThresholdMinSizeParameter(AntlrSQLParser::ThresholdMinSizeParameterContext* context) override;
     void enterInlineSource(AntlrSQLParser::InlineSourceContext* context) override;
+
+    /// Focal handler
+    void handleFocalCall(AntlrSQLParser::FunctionCallContext* context, FocalReductionOp reduction);
 };
 
 }

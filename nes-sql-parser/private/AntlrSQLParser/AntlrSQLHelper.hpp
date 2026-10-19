@@ -22,12 +22,14 @@
 #include <utility>
 #include <variant>
 #include <vector>
+
 #include <Functions/LogicalFunction.hpp>
 #include <Operators/Windows/Aggregations/WindowAggregationLogicalFunction.hpp>
 #include <Operators/Windows/JoinLogicalOperator.hpp>
 #include <Plans/LogicalPlan.hpp>
 #include <Sinks/SinkDescriptor.hpp>
 #include <WindowTypes/Types/TimeBasedWindowType.hpp>
+#include <Operators/Windows/WindowedFocalLogicalOperator.hpp>
 
 #include <Functions/UnboundFieldAccessLogicalFunction.hpp>
 #include <Identifiers/Identifier.hpp>
@@ -103,6 +105,13 @@ public:
 
     /// Flag set while parsing a MODEL_INFERENCE TVF source to suppress identifier capture as FROM source
     bool isModelInference = false;
+
+    /// Focal parse state
+    bool hasFocal = false;
+    std::optional<FocalParameters> focalParameters;
+    std::optional<Identifier> focalPayloadField;
+    size_t focalFbMark = 0;
+    size_t focalConstMark = 0;
 
     [[nodiscard]] std::vector<LogicalFunction>& getWhereClauses();
     [[nodiscard]] std::vector<LogicalFunction>& getHavingClauses();

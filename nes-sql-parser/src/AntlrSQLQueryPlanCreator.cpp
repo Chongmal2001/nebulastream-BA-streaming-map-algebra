@@ -62,6 +62,7 @@
 #include <Operators/Windows/Aggregations/WindowAggregationLogicalFunction.hpp>
 #include <Operators/Windows/JoinLogicalOperator.hpp>
 #include <Operators/Windows/WindowedAggregationLogicalOperator.hpp>
+#include <Operators/Windows/WindowedFocalLogicalOperator.hpp>
 #include <Plans/LogicalPlan.hpp>
 #include <Plans/LogicalPlanBuilder.hpp>
 #include <Util/Overloaded.hpp>
@@ -71,6 +72,7 @@
 #include <WindowTypes/Measures/TimeMeasure.hpp>
 #include <WindowTypes/Types/SlidingWindow.hpp>
 #include <WindowTypes/Types/TumblingWindow.hpp>
+#include <boost/asio/execution/context.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <CommonParserFunctions.hpp>
@@ -79,6 +81,44 @@
 
 namespace NES::Parsers
 {
+namespace
+{
+std::optional<FocalReductionOp> tryParseFocalReduction(std::string_view upperName)
+{
+    static const std::unordered_map<std::string_view, FocalReductionOp> table{
+        {"FOCAL_SUM", FocalReductionOp::Sum},
+        {"FOCAL_MEAN", FocalReductionOp::Mean},
+        {"FOCAL_MAX", FocalReductionOp::Max},
+        {"FOCAL_MIN", FocalReductionOp::Min},
+    };
+    const auto it = table.find(upperName);
+    return it != table.end() ? std::optional{it->second} : std::nullopt;
+}
+
+std::optional<FocalBoundaryRule> tryParseFocalBoundary(std::string_view upperName)
+{
+    static const std::unordered_map<std::string_view, FocalBoundaryRule> table{
+        {
+            {"NODATA", FocalBoundaryRule::NoData},
+            {"CLAMP", FocalBoundaryRule::Clamp},
+            {"REFLECT", FocalBoundaryRule::Reflect},
+        }
+    };
+    const auto it = table.find(upperName);
+    return it != table.end()  ? std::optional{it->second} : std::nullopt;
+}
+std::optional<FocalNeighbourhoodShape> tryParseFocalShape(std::string_view upperName)
+{
+    static const std::unordered_map<std::string_view, FocalNeighbourhoodShape> table{
+        {"SQUARE", FocalNeighbourhoodShape::Square},
+        {"DISC",   FocalNeighbourhoodShape::Disc},
+    };
+    const auto it = table.find(upperName);
+    return it != table.end() ? std::optional{it->second} : std::nullopt;
+}
+
+}
+
 
 LogicalPlan AntlrSQLQueryPlanCreator::getQueryPlan() const
 {
@@ -530,6 +570,13 @@ void AntlrSQLQueryPlanCreator::exitPrimaryQuery(AntlrSQLParser::PrimaryQueryCont
     auto windowTypeOpt = helpers.top().windowType;
     if (windowTypeOpt.has_value() && helpers.top().joinKeyRelationHelper.empty())
     {
+        /// Focal and aggregation cannot coinhabit one query spec (different output cardinality)
+        if (helpers.top().hasFocal && (!helpers.top().windowAggs.empty() || !helpers.top().groupByFields.empty()))
+        {
+            throw InvalidQuerySyntax(
+                "FOCAL_* cannot be combined with aggregation functions or GROUP BY in the same query");
+        }
+
         const auto currentWindowTimestampOpt = helpers.top().windowTimestamp;
         if (!currentWindowTimestampOpt.has_value()
             || !std::holds_alternative<Windowing::UnboundTimeCharacteristic>(currentWindowTimestampOpt.value()))
@@ -539,56 +586,72 @@ void AntlrSQLQueryPlanCreator::exitPrimaryQuery(AntlrSQLParser::PrimaryQueryCont
                 currentWindowTimestampOpt.has_value() ? "two" : "none");
         }
         auto characteristic = std::get<Windowing::UnboundTimeCharacteristic>(currentWindowTimestampOpt.value());
-        auto aggregations = helpers.top().windowAggs
-            | std::views::transform(
-                                [](auto& agg)
-                                {
-                                    if (!agg.second.has_value())
-                                    {
-                                        throw InvalidQuerySyntax("Aggregation function must have a name.");
-                                    }
-                                    return WindowedAggregationLogicalOperator::ProjectedAggregation{agg.first, agg.second.value()};
-                                });
-        queryPlan = LogicalPlanBuilder::addWindowAggregation(
-            queryPlan,
-            windowTypeOpt.value(),
-            aggregations | std::ranges::to<std::vector>(),
-            helpers.top().groupByFields,
-            std::move(characteristic));
-    }
-
-    auto projections = helpers.top().getProjections()
-        | std::views::transform(
-                           [](const auto& pair)
-                           {
-                               if (!pair.first.has_value())
-                               {
-                                   return ProjectionLogicalOperator::UnboundProjection{
-                                       bindIdentifier(pair.second.explain(ExplainVerbosity::Short)), pair.second};
-                               }
-                               return ProjectionLogicalOperator::UnboundProjection{pair.first.value(), pair.second};
-                           });
-    queryPlan = LogicalPlanBuilder::addProjection(projections | std::ranges::to<std::vector>(), helpers.top().asterisk, queryPlan);
-
-    if (windowTypeOpt.has_value())
-    {
-        for (auto havingExpr = helpers.top().getHavingClauses().rbegin(); havingExpr != helpers.top().getHavingClauses().rend();
-             ++havingExpr)
+        if (helpers.top().hasFocal)
         {
-            queryPlan = LogicalPlanBuilder::addSelection(*havingExpr, queryPlan);
+            /// Windowed focal operator
+            INVARIANT(
+                helpers.top().focalParameters.has_value() && helpers.top().focalPayloadField.has_value(),
+                "hasFocal was set without focal parameters / payload field");
+            queryPlan = LogicalPlanBuilder::addWindowedFocal(
+                queryPlan,
+                windowTypeOpt.value(),
+                std::move(characteristic),
+                helpers.top().focalParameters.value(),
+                helpers.top().focalPayloadField.value());
         }
+        else
+        {
+            auto aggregations = helpers.top().windowAggs
+                | std::views::transform(
+                                    [](auto& agg)
+                                    {
+                                        if (!agg.second.has_value())
+                                        {
+                                            throw InvalidQuerySyntax("Aggregation function must have a name.");
+                                        }
+                                        return WindowedAggregationLogicalOperator::ProjectedAggregation{agg.first, agg.second.value()};
+                                    });
+            queryPlan = LogicalPlanBuilder::addWindowAggregation(
+                queryPlan,
+                windowTypeOpt.value(),
+                aggregations | std::ranges::to<std::vector>(),
+                helpers.top().groupByFields,
+                std::move(characteristic));
+        }
+
+        auto projections = helpers.top().getProjections()
+            | std::views::transform(
+                               [](const auto& pair)
+                               {
+                                   if (!pair.first.has_value())
+                                   {
+                                       return ProjectionLogicalOperator::UnboundProjection{
+                                           bindIdentifier(pair.second.explain(ExplainVerbosity::Short)), pair.second};
+                                   }
+                                   return ProjectionLogicalOperator::UnboundProjection{pair.first.value(), pair.second};
+                               });
+        queryPlan = LogicalPlanBuilder::addProjection(projections | std::ranges::to<std::vector>(), helpers.top().asterisk, queryPlan);
+
+        if (windowTypeOpt.has_value())
+        {
+            for (auto havingExpr = helpers.top().getHavingClauses().rbegin(); havingExpr != helpers.top().getHavingClauses().rend();
+                 ++havingExpr)
+            {
+                queryPlan = LogicalPlanBuilder::addSelection(*havingExpr, queryPlan);
+            }
+        }
+        helpers.pop();
+        if (helpers.empty())
+        {
+            queryPlans.push(queryPlan);
+        }
+        else
+        {
+            auto& subQueryHelper = helpers.top();
+            subQueryHelper.queryPlans.push_back(queryPlan);
+        }
+        AntlrSQLBaseListener::exitPrimaryQuery(context);
     }
-    helpers.pop();
-    if (helpers.empty())
-    {
-        queryPlans.push(queryPlan);
-    }
-    else
-    {
-        auto& subQueryHelper = helpers.top();
-        subQueryHelper.queryPlans.push_back(queryPlan);
-    }
-    AntlrSQLBaseListener::exitPrimaryQuery(context);
 }
 
 void AntlrSQLQueryPlanCreator::enterWindowClause(AntlrSQLParser::WindowClauseContext* context)
@@ -727,6 +790,11 @@ void AntlrSQLQueryPlanCreator::exitNamedExpression(AntlrSQLParser::NamedExpressi
 
 void AntlrSQLQueryPlanCreator::enterFunctionCall(AntlrSQLParser::FunctionCallContext* context)
 {
+    if (tryParseFocalReduction(context->children[0]->getText()).has_value())
+    {
+        helpers.top().focalFbMark = helpers.top().functionBuilder.size();
+        helpers.top().focalConstMark = helpers.top().constantBuilder.size();
+    }
     AntlrSQLBaseListener::enterFunctionCall(context);
 }
 
@@ -946,6 +1014,14 @@ void AntlrSQLQueryPlanCreator::exitFunctionCall(AntlrSQLParser::FunctionCallCont
 {
     const auto funcName = toUpperCase(context->children[0]->getText());
     const auto tokenType = context->getStart()->getType();
+
+    /// FOCAL_* is a windowed focal operator, not a scalar/aggregation function
+    /// just record its spec on the helper and return early => exitPrimaryQuery lifts it into WindowedFocalLogicalOperator
+    if (const auto reduction = tryParseFocalReduction(funcName); reduction.has_value())
+    {
+        handleFocalCall(context, *reduction);
+        return;
+    }
 
     /// Ensures the current aggregation argument is a direct field access.
     /// If the argument is an expression (e.g. i + UINT64(1)), desugars it into a pre-aggregation
@@ -1202,4 +1278,68 @@ void AntlrSQLQueryPlanCreator::exitModelInferenceRelation(AntlrSQLParser::ModelI
     helpers.top().isModelInference = false;
     AntlrSQLBaseListener::exitModelInferenceRelation(context);
 }
+
+void AntlrSQLQueryPlanCreator::handleFocalCall(
+    AntlrSQLParser::FunctionCallContext* context, FocalReductionOp reduction)
+{
+    /// Positional contract
+    /// FOCAL_<OP>(payload, shape, radius, boundary, noData, rasterW, rasterH, tileW, tileH)
+    constexpr size_t expectedArgs = 9;
+
+    const auto numArgs = context->argument.size();
+    if (numArgs != expectedArgs)
+    {
+        throw InvalidQuerySyntax(
+            "FOCAL_* expects {} arguments (payload, shape, radius, boundary, noData, rasterW, rasterH, tileW, tileH), "
+            "got {} at {}",
+            expectedArgs, numArgs, context->getText());
+    }
+
+    auto& fb = helpers.top().functionBuilder;
+
+    /// payload
+    const auto payloadField = bindIdentifier(context->argument[0]->getText());
+
+    /// shape
+    const auto shape = tryParseFocalShape(toUpperCase(context->argument[1]->getText()));
+    if (!shape)
+    {
+        throw InvalidQuerySyntax("FOCAL_* unknown neighbourhood shape '{}' (expected SQUARE|DISC)",
+                                 context->argument[1]->getText());
+    }
+    /// boundary
+    const auto boundary = tryParseFocalBoundary(toUpperCase(context->argument[3]->getText()));
+    if (!boundary)
+    {
+        throw InvalidQuerySyntax("FOCAL_* unknown boundary rule '{}' (expected NODATA|CLAMP|REFLECT)",
+                                 context->argument[3]->getText());
+    }
+    /// radius
+    const auto radius = static_cast<int32_t>(std::stol(context->argument[2]->getText()));
+    if (radius < 0)
+    {
+        throw InvalidQuerySyntax("FOCAL_* radius must be >= 0, got {}", radius);
+    }
+    const FocalParameters params{
+        .rasterWidth   = std::stoll(context->argument[5]->getText()),
+        .rasterHeight  = std::stoll(context->argument[6]->getText()),
+        .tileWidth     = static_cast<int32_t>(std::stol(context->argument[7]->getText())),
+        .tileHeight    = static_cast<int32_t>(std::stol(context->argument[8]->getText())),
+        .radius        = radius,
+        .neighbourhood = *shape,
+        .reduction     = reduction,
+        .boundary      = *boundary,
+        .noData        = std::stod(context->argument[4]->getText()),
+    };
+
+    helpers.top().hasFocal = true;
+    helpers.top().focalParameters = params;
+    helpers.top().focalPayloadField = payloadField;
+
+    fb.resize(helpers.top().focalFbMark);
+    helpers.top().constantBuilder.resize(helpers.top().focalConstMark);
+    fb.emplace_back(UnboundFieldAccessLogicalFunction(payloadField));
 }
+
+}
+
