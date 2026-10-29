@@ -6,8 +6,9 @@
 
 namespace Raster
 {
-enum class FocalStatus : int32_t { Ok = 0, OutputTooSmall = -1, BadGeometry = -2 };
+enum class FocalStatus : int32_t { Ok = 0, OutputTooSmall = -1, BadGeometry = -2, BadBands = -3 };
 
-/// Computes the output tile as specified by spec into "out"
-FocalStatus evaluateTile(const FocalSpec& spec, const FocalContext& ctx, double* out, uint64_t outCells) noexcept;
+
+/// Focal operation for all bands, band-major output
+FocalStatus evaluateTile(const FocalSpec& spec, const FocalContext& ctx, double* out, uint64_t outCells, uint32_t bands = 1) noexcept;
 }

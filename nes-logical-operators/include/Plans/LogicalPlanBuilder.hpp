@@ -32,7 +32,7 @@
 #include <Operators/Windows/Aggregations/WindowAggregationLogicalFunction.hpp>
 #include <Operators/Windows/JoinLogicalOperator.hpp>
 #include <Operators/Windows/WindowedAggregationLogicalOperator.hpp>
-#include <Operators/Windows/WindowedFocalLogicalOperator.hpp>
+#include <Operators/Windows/WindowedFocalFrameLogicalOperator.hpp>
 #include <Plans/LogicalPlan.hpp>
 #include <WindowTypes/Measures/TimeCharacteristic.hpp>
 #include <WindowTypes/Types/TimeBasedWindowType.hpp>
@@ -110,7 +110,8 @@ public:
     /// If a watermark operator exists in the queryPlan and if not adds a watermark strategy to the queryPlan.
     static LogicalPlan checkAndAddWatermarkAssigner(LogicalPlan queryPlan, const Windowing::TimeCharacteristic& timeCharacteristic);
 
-    static LogicalPlan addWindowedFocal(
+    /// Focal on binary maplets (WindowedFocalFrameLogicalOperator); no tile position fields
+    static LogicalPlan addWindowedFocalFrame(
         LogicalPlan queryPlan,
         const Windowing::TimeBasedWindowType& windowType,
         Windowing::TimeCharacteristic timeCharacteristic,

@@ -51,6 +51,7 @@
 #include <Operators/Windows/Aggregations/WindowAggregationLogicalFunction.hpp>
 #include <Operators/Windows/JoinLogicalOperator.hpp>
 #include <Operators/Windows/WindowedAggregationLogicalOperator.hpp>
+#include <Operators/Windows/WindowedFocalFrameLogicalOperator.hpp>
 #include <Plans/LogicalPlan.hpp>
 #include <Util/Common.hpp>
 #include <Util/Logger/Logger.hpp>
@@ -251,7 +252,7 @@ LogicalPlan LogicalPlanBuilder::addBinaryOperatorAndUpdateSource(
     return promoteOperatorToRoot(leftLogicalPlan.withRootOperators(newRootOperators | std::ranges::to<std::vector>()), operatorNode);
 }
 
-LogicalPlan LogicalPlanBuilder::addWindowedFocal(
+LogicalPlan LogicalPlanBuilder::addWindowedFocalFrame(
     LogicalPlan queryPlan,
     const Windowing::TimeBasedWindowType& windowType,
     Windowing::TimeCharacteristic timeCharacteristic,
@@ -260,22 +261,11 @@ LogicalPlan LogicalPlanBuilder::addWindowedFocal(
 {
     PRECONDITION(not queryPlan.getRootOperators().empty(), "invalid query plan, as the root operator is empty");
 
-
     queryPlan = checkAndAddWatermarkAssigner(queryPlan, timeCharacteristic);
 
-    /// tileX / tileY are resolved by naming convention (validated in inferLocalSchema)
-    /// only the payload field is user-chosen (arg 0)
-    auto tileXField = Identifier::parse("tileX");
-    auto tileYField = Identifier::parse("tileY");
-
+    /// maplets locate themselves; lineage fields are found by name in inferLocalSchema
     return promoteOperatorToRoot(
         queryPlan,
-        WindowedFocalLogicalOperator::create(
-            std::move(tileXField),
-            std::move(tileYField),
-            std::move(payloadField),
-            std::move(params),
-            windowType,
-            std::move(timeCharacteristic)));
+        WindowedFocalFrameLogicalOperator::create(std::move(payloadField), std::move(params), windowType, std::move(timeCharacteristic)));
 }
 }

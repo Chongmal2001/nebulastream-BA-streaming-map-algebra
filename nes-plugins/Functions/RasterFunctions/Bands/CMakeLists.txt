@@ -1,0 +1,11 @@
+add_plugin_as_library(Bands LogicalFunction bands_logical_function_plugin_library BandsLogicalFunction.cpp)
+target_link_libraries(bands_logical_function_plugin_library PRIVATE nes-logical-operators)
+target_include_directories(bands_logical_function_plugin_library PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_unreflection_plugin(LogicalFunction Bands)
+get_property(bands_glue GLOBAL PROPERTY "LogicalFunction_UNREFLECTION_GLUE_LIB")
+target_include_directories(${bands_glue} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_plugin_as_library(Bands PhysicalFunction bands_physical_function_plugin_library BandsPhysicalFunction.cpp)
+target_link_libraries(bands_physical_function_plugin_library PRIVATE nes-physical-operators nes-raster-codec)
+target_include_directories(bands_physical_function_plugin_library PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

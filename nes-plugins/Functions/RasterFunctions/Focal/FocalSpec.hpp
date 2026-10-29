@@ -1,16 +1,29 @@
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <optional>
+#include <string_view>
 #include <vector>
 
 namespace Raster
 {
 enum class ReductionOp  : uint8_t { Mean, Max, Min, Sum };
 enum class BoundaryRule : uint8_t { NoData, Clamp, Reflect };
+/// Sum/Mean on dense squares: Exact (default), Running sums, Kahan (compensated running sums)
+enum class Summation : uint8_t { Exact, Running, Kahan };
+
+inline std::optional<Summation> parseSummation(std::string_view name)
+{
+    if (name.empty() || name == "exact") return Summation::Exact;
+    if (name == "running") return Summation::Running;
+    if (name == "kahan") return Summation::Kahan;
+    return std::nullopt;
+}
 
 struct Offset { int32_t dx; int32_t dy; };
 
-/// Neighbourhood: which input cells the kernel reads for each output cell, as signed cell offsets
+/// Cells read per output cell, as signed offsets
 struct Neighbourhood
 {
     std::vector<Offset> offsets;
@@ -22,6 +35,7 @@ struct FocalSpec
     Neighbourhood n;
     ReductionOp   kappa = ReductionOp::Mean;
     BoundaryRule  beta  = BoundaryRule::NoData;
+    Summation     summation = Summation::Exact;
 };
 
 /// The locator fields the kernel needs
@@ -51,7 +65,7 @@ inline Neighbourhood makeDenseSquare(int32_t r)
     return nbh;
 }
 
-/// Disc of radius r (proves the shape-agnostic path)
+/// Disc of radius r
 inline Neighbourhood makeDisc(int32_t r)
 {
     Neighbourhood nbh;
@@ -70,14 +84,14 @@ inline Neighbourhood makeDisc(int32_t r)
     return nbh;
 }
 
-/// Converts a cell-level kernel radius into tile-level reach => how many tiles the neighbourhood spans in each direction
+/// Tiles the neighbourhood spans in each direction
 struct TileReach { int32_t horizontal; int32_t vertical; };
 inline TileReach computeTileReach(const RasterGeometry& g, int32_t radius)
 {
     return {(radius + g.tileW - 1) / g.tileW, (radius + g.tileH - 1) / g.tileH};
 }
 
-/// Calls a function on every existing neighbour tile of the centre tile
+/// Calls fn on every existing neighbour tile of the centre tile
 template <typename Fn>
 void forEachNeighbourTile(const RasterGeometry& g, int32_t centreTileX, int32_t centreTileY, TileReach reach, Fn&& fn)
 {
@@ -90,7 +104,7 @@ void forEachNeighbourTile(const RasterGeometry& g, int32_t centreTileX, int32_t 
             fn(tx, ty);
 }
 
-/// Position of a tile within its raster in tile indices, not cell offsets
+/// Tile position in tile indices
 struct TilePosition { int32_t x; int32_t y; };
 
 [[nodiscard]] inline size_t tileIndex(const RasterGeometry& g, TilePosition pos)

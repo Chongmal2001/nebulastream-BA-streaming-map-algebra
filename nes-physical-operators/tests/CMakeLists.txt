@@ -21,6 +21,12 @@ add_nes_physical_operator_test(AndOrPhysicalFunctionTest AndOrPhysicalFunctionTe
 add_nes_physical_operator_test(SliceAssignerTest SliceAssignerTest.cpp)
 add_nes_physical_operator_test(SliceCacheTest SliceCacheTest.cpp)
 
+# Raster operators: frame table, focal frame state, focal slice on NES buffers
+add_nes_physical_operator_test(FrameTableTest Raster/FrameTableTest.cpp)
+add_nes_physical_operator_test(FocalFrameStateTest Raster/FocalFrameStateTest.cpp)
+add_nes_physical_operator_test(RasterSliceTest Raster/RasterSliceTest.cpp)
+add_nes_physical_operator_test(FocalFrameOperatorHandlerTest Raster/FocalFrameOperatorHandlerTest.cpp)
+
 if (ENABLE_IREE_TESTS)
     add_definitions(-DINFERENCE_TEST_DATA="${CMAKE_SOURCE_DIR}/nes-inference/tests/testdata")
 

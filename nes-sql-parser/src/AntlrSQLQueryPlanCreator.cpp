@@ -62,7 +62,7 @@
 #include <Operators/Windows/Aggregations/WindowAggregationLogicalFunction.hpp>
 #include <Operators/Windows/JoinLogicalOperator.hpp>
 #include <Operators/Windows/WindowedAggregationLogicalOperator.hpp>
-#include <Operators/Windows/WindowedFocalLogicalOperator.hpp>
+#include <Operators/Windows/WindowedFocalFrameLogicalOperator.hpp>
 #include <Plans/LogicalPlan.hpp>
 #include <Plans/LogicalPlanBuilder.hpp>
 #include <Util/Overloaded.hpp>
@@ -592,7 +592,7 @@ void AntlrSQLQueryPlanCreator::exitPrimaryQuery(AntlrSQLParser::PrimaryQueryCont
             INVARIANT(
                 helpers.top().focalParameters.has_value() && helpers.top().focalPayloadField.has_value(),
                 "hasFocal was set without focal parameters / payload field");
-            queryPlan = LogicalPlanBuilder::addWindowedFocal(
+            queryPlan = LogicalPlanBuilder::addWindowedFocalFrame(
                 queryPlan,
                 windowTypeOpt.value(),
                 std::move(characteristic),
@@ -618,40 +618,41 @@ void AntlrSQLQueryPlanCreator::exitPrimaryQuery(AntlrSQLParser::PrimaryQueryCont
                 helpers.top().groupByFields,
                 std::move(characteristic));
         }
-
-        auto projections = helpers.top().getProjections()
-            | std::views::transform(
-                               [](const auto& pair)
-                               {
-                                   if (!pair.first.has_value())
-                                   {
-                                       return ProjectionLogicalOperator::UnboundProjection{
-                                           bindIdentifier(pair.second.explain(ExplainVerbosity::Short)), pair.second};
-                                   }
-                                   return ProjectionLogicalOperator::UnboundProjection{pair.first.value(), pair.second};
-                               });
-        queryPlan = LogicalPlanBuilder::addProjection(projections | std::ranges::to<std::vector>(), helpers.top().asterisk, queryPlan);
-
-        if (windowTypeOpt.has_value())
-        {
-            for (auto havingExpr = helpers.top().getHavingClauses().rbegin(); havingExpr != helpers.top().getHavingClauses().rend();
-                 ++havingExpr)
-            {
-                queryPlan = LogicalPlanBuilder::addSelection(*havingExpr, queryPlan);
-            }
-        }
-        helpers.pop();
-        if (helpers.empty())
-        {
-            queryPlans.push(queryPlan);
-        }
-        else
-        {
-            auto& subQueryHelper = helpers.top();
-            subQueryHelper.queryPlans.push_back(queryPlan);
-        }
-        AntlrSQLBaseListener::exitPrimaryQuery(context);
     }
+
+    /// Projection and hand-off of the plan apply to every query, windowed or not
+    auto projections = helpers.top().getProjections()
+        | std::views::transform(
+                           [](const auto& pair)
+                           {
+                               if (!pair.first.has_value())
+                               {
+                                   return ProjectionLogicalOperator::UnboundProjection{
+                                       bindIdentifier(pair.second.explain(ExplainVerbosity::Short)), pair.second};
+                               }
+                               return ProjectionLogicalOperator::UnboundProjection{pair.first.value(), pair.second};
+                           });
+    queryPlan = LogicalPlanBuilder::addProjection(projections | std::ranges::to<std::vector>(), helpers.top().asterisk, queryPlan);
+
+    if (windowTypeOpt.has_value())
+    {
+        for (auto havingExpr = helpers.top().getHavingClauses().rbegin(); havingExpr != helpers.top().getHavingClauses().rend();
+             ++havingExpr)
+        {
+            queryPlan = LogicalPlanBuilder::addSelection(*havingExpr, queryPlan);
+        }
+    }
+    helpers.pop();
+    if (helpers.empty())
+    {
+        queryPlans.push(queryPlan);
+    }
+    else
+    {
+        auto& subQueryHelper = helpers.top();
+        subQueryHelper.queryPlans.push_back(queryPlan);
+    }
+    AntlrSQLBaseListener::exitPrimaryQuery(context);
 }
 
 void AntlrSQLQueryPlanCreator::enterWindowClause(AntlrSQLParser::WindowClauseContext* context)
@@ -1016,7 +1017,7 @@ void AntlrSQLQueryPlanCreator::exitFunctionCall(AntlrSQLParser::FunctionCallCont
     const auto tokenType = context->getStart()->getType();
 
     /// FOCAL_* is a windowed focal operator, not a scalar/aggregation function
-    /// just record its spec on the helper and return early => exitPrimaryQuery lifts it into WindowedFocalLogicalOperator
+    /// just record its spec on the helper and return early => exitPrimaryQuery lifts it into WindowedFocalFrameLogicalOperator
     if (const auto reduction = tryParseFocalReduction(funcName); reduction.has_value())
     {
         handleFocalCall(context, *reduction);

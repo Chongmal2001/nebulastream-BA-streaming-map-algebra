@@ -1,18 +1,8 @@
-/*
-    Licensed under the Apache License, Version 2.0 (the "License");
-    you may not use this file except in compliance with the License.
-    You may obtain a copy of the License at
-        https://www.apache.org/licenses/LICENSE-2.0
-    Unless required by applicable law or agreed to in writing, software
-    distributed under the License is distributed on an "AS IS" BASIS,
-    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    See the License for the specific language governing permissions and
-    limitations under the License.
-*/
-
 #include <MapletCodec.hpp>
 
+#include <algorithm>
 #include <cstdlib>
+#include <cerrno>
 #include <charconv>
 #include <cmath>
 #include <limits>
@@ -26,14 +16,7 @@ constexpr bool isSpace(char ch) { return ch == ' ' || ch == '\t' || ch == '\n' |
 
 constexpr char toLower(char ch) { return (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch + 32) : ch; }
 
-/// NaN-aware equality, so a NaN sentinel matches a NaN preamble field.
-bool sentinelEqual(double a, double b)
-{
-    return (std::isnan(a) && std::isnan(b)) || a == b;
-}
-
-/// Parse one text token [b, e). Accepts an optional-signed "nan" spelling
-/// (case-insensitive) as NaN; everything else goes through from_chars.
+/// Parses one token; optionally signed "nan" (any case) is NaN
 bool parseCell(const char* tokenBegin, const char* tokenEnd, double& parsedValue)
 {
     const std::ptrdiff_t tokenLength = tokenEnd - tokenBegin;
@@ -42,8 +25,7 @@ bool parseCell(const char* tokenBegin, const char* tokenEnd, double& parsedValue
         return false;
     }
 
-    // Explicit NaN handling keeps the NoData intent legible and independent of
-    // strtod's own nan() parsing.
+    // explicit NaN, independent of strtod's nan()
     const char* afterSign = tokenBegin;
     if (afterSign < tokenEnd && (*afterSign == '+' || *afterSign == '-'))
     {
@@ -56,9 +38,7 @@ bool parseCell(const char* tokenBegin, const char* tokenEnd, double& parsedValue
         return true;
     }
 
-    // Copy into a null-terminated buffer so strtod cannot read past tokenEnd.
-    // A shortest-round-trip double is at most ~24 characters, so this bound only
-    // rejects pathologically long input, which is reported as a malformed cell.
+    // null-terminated copy so strtod stays inside the token
     constexpr std::size_t MAX_TOKEN_CHARS = 63;
     if (static_cast<std::size_t>(tokenLength) > MAX_TOKEN_CHARS)
     {
@@ -72,9 +52,7 @@ bool parseCell(const char* tokenBegin, const char* tokenEnd, double& parsedValue
     char* parseEnd = nullptr;
     const double value = std::strtod(nullTerminatedToken, &parseEnd);
 
-    // Reject unless the entire token was consumed. Only overflow is treated as a
-    // range error: underflow to a denormal reports ERANGE too, but returns a
-    // finite value we want to keep, so the round-trip of denorm_min still holds.
+    // whole token must parse; only overflow is a range error (denormals kept)
     if (parseEnd != nullTerminatedToken + tokenLength)
     {
         return false;
@@ -125,14 +103,14 @@ CodecStatus decodeText(const int8_t* in, uint64_t inSize, const TileSpec& spec, 
         }
         ++p;
     }
-    out = GridView{scratch, spec.height, spec.width, spec.noData};
+    out = GridView{scratch, spec.height, spec.width, spec.noData, spec.bands};
     return CodecStatus::Ok;
 }
 
-CodecStatus decodeBinary(const int8_t* in, uint64_t inSize, const TileSpec& spec, double* scratch, uint64_t scratchCells,
-                         GridView& out)
+/// Parses and checks the preamble without looking at the cells. Shared by peekHeader, decode and selectBands.
+CodecStatus readPreamble(const int8_t* in, uint64_t inSize, MapletHeader& h)
 {
-    if (inSize < BINARY_HEADER_SIZE)
+    if (in == nullptr || inSize < BINARY_HEADER_SIZE)
     {
         return CodecStatus::TruncatedInput;
     }
@@ -144,44 +122,89 @@ CodecStatus decodeBinary(const int8_t* in, uint64_t inSize, const TileSpec& spec
     {
         return CodecStatus::UnsupportedCellType;
     }
-    if (static_cast<uint8_t>(in[2]) != 1)  // single-band focal path
+    h.bands = static_cast<uint8_t>(in[2]);
+    h.flags = static_cast<uint8_t>(in[3]);
+    std::memcpy(&h.frameId, in + 4, sizeof h.frameId);
+    std::memcpy(&h.tileX, in + 8, sizeof h.tileX);
+    std::memcpy(&h.tileY, in + 12, sizeof h.tileY);
+    std::memcpy(&h.height, in + 16, sizeof h.height);
+    std::memcpy(&h.width, in + 20, sizeof h.width);
+    std::memcpy(&h.rasterWidth, in + 24, sizeof h.rasterWidth);
+    std::memcpy(&h.rasterHeight, in + 28, sizeof h.rasterHeight);
+    if (h.bands == 0 || h.height == 0 || h.width == 0)
     {
         return CodecStatus::BadDimensions;
     }
-    uint32_t h{};
-    uint32_t w{};
-    double nd{};
-    std::memcpy(&h, in + 4, sizeof h);
-    std::memcpy(&w, in + 8, sizeof w);
-    std::memcpy(&nd, in + 16, sizeof nd);
-    if (h != spec.height || w != spec.width)
+    // planeCells() fits in 64 bits (two u32); bounding it by the input first keeps bands * plane * 8 from overflowing.
+    if (h.planeCells() > (inSize - BINARY_HEADER_SIZE) / sizeof(double))
     {
-        return CodecStatus::SizeMismatch;
+        return CodecStatus::TruncatedInput;
     }
-    if (!sentinelEqual(nd, spec.noData))
-    {
-        return CodecStatus::SizeMismatch;
-    }
-    const uint64_t cells = static_cast<uint64_t>(h) * w;
-    const uint64_t need = BINARY_HEADER_SIZE + (cells * sizeof(double));
+    const uint64_t need = h.totalSize();
     if (inSize < need)
     {
         return CodecStatus::TruncatedInput;
     }
     if (inSize > need)
     {
-        return CodecStatus::SizeMismatch;  // trailing garbage
+        return CodecStatus::SizeMismatch;  // trailing bytes
     }
+    if (h.rasterWidth != 0 && h.rasterHeight != 0)
+    {
+        const int64_t tilesX = (static_cast<int64_t>(h.rasterWidth) + h.width - 1) / h.width;
+        const int64_t tilesY = (static_cast<int64_t>(h.rasterHeight) + h.height - 1) / h.height;
+        if (h.tileX < 0 || h.tileY < 0 || h.tileX >= tilesX || h.tileY >= tilesY)
+        {
+            return CodecStatus::PositionOutOfRange;
+        }
+    }
+    return CodecStatus::Ok;
+}
+
+CodecStatus decodeBinary(const int8_t* in, uint64_t inSize, const TileSpec& spec, double* scratch, uint64_t scratchCells,
+                         GridView& out, MapletHeader* hdrOut)
+{
+    MapletHeader h;
+    if (const auto st = readPreamble(in, inSize, h); st != CodecStatus::Ok)
+    {
+        return st;
+    }
+    if (h.bands != spec.bands || h.height != spec.height || h.width != spec.width)
+    {
+        return CodecStatus::SizeMismatch;  // shape is a per-stream invariant
+    }
+    if ((spec.rasterWidth != 0 && h.rasterWidth != spec.rasterWidth) || (spec.rasterHeight != 0 && h.rasterHeight != spec.rasterHeight))
+    {
+        return CodecStatus::SizeMismatch;
+    }
+    const uint64_t cells = h.cellCount();
     if (scratchCells < cells)
     {
         return CodecStatus::ScratchTooSmall;
     }
-    // Copy into caller storage. When the source buffer is 8-byte aligned and the
-    // caller retains it, out.cells could alias `in + BINARY_HEADER_SIZE` instead
-    // (true zero-copy). Deferred to the v2 retention path.
+    // copy out: VARSIZED payload may be unaligned
     std::memcpy(scratch, in + BINARY_HEADER_SIZE, cells * sizeof(double));
-    out = GridView{scratch, h, w, spec.noData};
+    out = GridView{scratch, h.height, h.width, spec.noData, h.bands};
+    if (hdrOut != nullptr)
+    {
+        *hdrOut = h;
+    }
     return CodecStatus::Ok;
+}
+
+void writePreamble(int8_t* out, const MapletHeader& h)
+{
+    out[0] = static_cast<int8_t>(WireFormat::Binary);
+    out[1] = static_cast<int8_t>(CellType::Float64);
+    out[2] = static_cast<int8_t>(h.bands);
+    out[3] = static_cast<int8_t>(h.flags);
+    std::memcpy(out + 4, &h.frameId, sizeof h.frameId);
+    std::memcpy(out + 8, &h.tileX, sizeof h.tileX);
+    std::memcpy(out + 12, &h.tileY, sizeof h.tileY);
+    std::memcpy(out + 16, &h.height, sizeof h.height);
+    std::memcpy(out + 20, &h.width, sizeof h.width);
+    std::memcpy(out + 24, &h.rasterWidth, sizeof h.rasterWidth);
+    std::memcpy(out + 28, &h.rasterHeight, sizeof h.rasterHeight);
 }
 
 CodecStatus encodeText(const GridView& grid, int8_t* out, uint64_t capacity, uint64_t& bytesWritten)
@@ -224,34 +247,112 @@ CodecStatus encodeText(const GridView& grid, int8_t* out, uint64_t capacity, uin
     return CodecStatus::Ok;
 }
 
-CodecStatus encodeBinary(const GridView& grid, const TileSpec& spec, int8_t* out, uint64_t capacity,
-                         uint64_t& bytesWritten)
+CodecStatus encodeBinary(const GridView& grid, const TileSpec& spec, const MapletPlacement* placement, int8_t* out,
+                         uint64_t capacity, uint64_t& bytesWritten)
 {
-    const uint64_t cells = grid.cellCount();
-    const uint64_t need = BINARY_HEADER_SIZE + (cells * sizeof(double));
+    if (placement == nullptr)
+    {
+        return CodecStatus::MissingPlacement;
+    }
+    if (spec.rasterWidth == 0 || spec.rasterHeight == 0)
+    {
+        return CodecStatus::BadDimensions;  // a binary maplet must say where its raster ends
+    }
+    if (placement->tileX < 0 || placement->tileY < 0 || static_cast<uint32_t>(placement->tileX) >= spec.tilesX()
+        || static_cast<uint32_t>(placement->tileY) >= spec.tilesY())
+    {
+        return CodecStatus::PositionOutOfRange;
+    }
+    const MapletHeader h{spec.bands,  placement->flags, placement->frameId, placement->tileX, placement->tileY,
+                         spec.height, spec.width,       spec.rasterWidth,   spec.rasterHeight};
+    const uint64_t need = h.totalSize();
     if (capacity < need)
     {
         return CodecStatus::OutputTooSmall;
     }
-    std::memset(out, 0, BINARY_HEADER_SIZE);  // zero the reserved bytes
-    out[0] = static_cast<int8_t>(WireFormat::Binary);
-    out[1] = static_cast<int8_t>(spec.cellType);
-    out[2] = static_cast<int8_t>(1);
-    const uint32_t h = grid.h;
-    const uint32_t w = grid.w;
-    std::memcpy(out + 4, &h, sizeof h);
-    std::memcpy(out + 8, &w, sizeof w);
-    std::memcpy(out + 16, &spec.noData, sizeof(double));
-    std::memcpy(out + BINARY_HEADER_SIZE, grid.cells, cells * sizeof(double));
+    writePreamble(out, h);
+    std::memcpy(out + BINARY_HEADER_SIZE, grid.cells, h.cellCount() * sizeof(double));
     bytesWritten = need;
     return CodecStatus::Ok;
 }
 }  // namespace
 
-CodecStatus decode(const int8_t* in, uint64_t inSize, const TileSpec& spec, double* scratch, uint64_t scratchCells,
-                   GridView& out) noexcept
+std::string_view toString(CodecStatus status) noexcept
 {
-    if (spec.height == 0 || spec.width == 0)
+    switch (status)
+    {
+        case CodecStatus::Ok: return "Ok";
+        case CodecStatus::TruncatedInput: return "TruncatedInput";
+        case CodecStatus::UnsupportedVersion: return "UnsupportedVersion";
+        case CodecStatus::UnsupportedCellType: return "UnsupportedCellType";
+        case CodecStatus::SizeMismatch: return "SizeMismatch";
+        case CodecStatus::ScratchTooSmall: return "ScratchTooSmall";
+        case CodecStatus::OutputTooSmall: return "OutputTooSmall";
+        case CodecStatus::MalformedNumber: return "MalformedNumber";
+        case CodecStatus::BadDimensions: return "BadDimensions";
+        case CodecStatus::BandOutOfRange: return "BandOutOfRange";
+        case CodecStatus::PositionOutOfRange: return "PositionOutOfRange";
+        case CodecStatus::MissingPlacement: return "MissingPlacement";
+    }
+    return "UnknownStatus";
+}
+
+uint32_t MapletHeader::validRows() const
+{
+    const int64_t v = static_cast<int64_t>(rasterHeight) - (static_cast<int64_t>(tileY) * height);
+    return static_cast<uint32_t>(std::clamp<int64_t>(v, 0, height));
+}
+
+uint32_t MapletHeader::validCols() const
+{
+    const int64_t v = static_cast<int64_t>(rasterWidth) - (static_cast<int64_t>(tileX) * width);
+    return static_cast<uint32_t>(std::clamp<int64_t>(v, 0, width));
+}
+
+CodecStatus peekHeader(const int8_t* in, uint64_t inSize, MapletHeader& out) noexcept
+{
+    return readPreamble(in, inSize, out);
+}
+
+CodecStatus peekFrameHeader(const int8_t* in, uint64_t inSize, FrameHeader& out) noexcept
+{
+    if (in == nullptr || inSize < FRAME_HEADER_SIZE)
+    {
+        return CodecStatus::TruncatedInput;
+    }
+    if (std::memcmp(in, FRAME_MAGIC.data(), FRAME_MAGIC.size()) != 0)
+    {
+        return CodecStatus::UnsupportedVersion;
+    }
+    if (static_cast<uint8_t>(in[41]) != static_cast<uint8_t>(CellType::Float64))
+    {
+        return CodecStatus::UnsupportedCellType;
+    }
+    FrameHeader h;
+    std::memcpy(&h.frameId, in + 8, sizeof h.frameId);
+    std::memcpy(&h.nTiles, in + 12, sizeof h.nTiles);
+    std::memcpy(&h.eventTimeMs, in + 16, sizeof h.eventTimeMs);
+    std::memcpy(&h.rasterWidth, in + 24, sizeof h.rasterWidth);
+    std::memcpy(&h.rasterHeight, in + 28, sizeof h.rasterHeight);
+    std::memcpy(&h.tileWidth, in + 32, sizeof h.tileWidth);
+    std::memcpy(&h.tileHeight, in + 36, sizeof h.tileHeight);
+    h.bands = static_cast<uint8_t>(in[40]);
+    std::memcpy(&h.flags, in + 42, sizeof h.flags);
+    std::memcpy(&h.noData, in + 48, sizeof h.noData);
+    std::memcpy(&h.crsEpsg, in + 56, sizeof h.crsEpsg);
+    std::memcpy(h.transform.data(), in + 64, sizeof(double) * h.transform.size());
+    if (h.bands == 0 || h.rasterWidth == 0 || h.rasterHeight == 0 || h.tileWidth == 0 || h.tileHeight == 0)
+    {
+        return CodecStatus::BadDimensions;
+    }
+    out = h;
+    return CodecStatus::Ok;
+}
+
+CodecStatus decode(const int8_t* in, uint64_t inSize, const TileSpec& spec, double* scratch, uint64_t scratchCells, GridView& out,
+                   MapletHeader* hdrOut) noexcept
+{
+    if (spec.height == 0 || spec.width == 0 || spec.bands == 0)
     {
         return CodecStatus::BadDimensions;
     }
@@ -264,20 +365,20 @@ CodecStatus decode(const int8_t* in, uint64_t inSize, const TileSpec& spec, doub
         case WireFormat::Text:
             return decodeText(in, inSize, spec, scratch, scratchCells, out);
         case WireFormat::Binary:
-            return decodeBinary(in, inSize, spec, scratch, scratchCells, out);
+            return decodeBinary(in, inSize, spec, scratch, scratchCells, out, hdrOut);
     }
     return CodecStatus::UnsupportedVersion;
 }
 
-CodecStatus encode(const GridView& grid, const TileSpec& spec, int8_t* out, uint64_t capacity,
+CodecStatus encode(const GridView& grid, const TileSpec& spec, const MapletPlacement* placement, int8_t* out, uint64_t capacity,
                    uint64_t& bytesWritten) noexcept
 {
     bytesWritten = 0;
-    if (spec.height == 0 || spec.width == 0)
+    if (spec.height == 0 || spec.width == 0 || spec.bands == 0)
     {
         return CodecStatus::BadDimensions;
     }
-    if (grid.h != spec.height || grid.w != spec.width || grid.cells == nullptr)
+    if (grid.h != spec.height || grid.w != spec.width || grid.bands != spec.bands || grid.cells == nullptr)
     {
         return CodecStatus::SizeMismatch;
     }
@@ -290,13 +391,123 @@ CodecStatus encode(const GridView& grid, const TileSpec& spec, int8_t* out, uint
         case WireFormat::Text:
             return encodeText(grid, out, capacity, bytesWritten);
         case WireFormat::Binary:
-            return encodeBinary(grid, spec, out, capacity, bytesWritten);
-    }/// Plugin-neutral focal config. nes-logical-operators must NOT depend on the raster plugin
-/// (dependency direction: plugins depend on core, not the reverse), so the logical op describes
-/// the operation in primitives + local enums; the lowering rule maps these to Raster::{RasterGeometry,
-/// FocalSpec, TileSpec}. (Alternative: include the plugin's FocalSpec.hpp and reuse Raster::ReductionOp
-/// etc. — less code, but couples this module to a plugin. I default to decoupled.)
+            return encodeBinary(grid, spec, placement, out, capacity, bytesWritten);
+    }
     return CodecStatus::UnsupportedVersion;
+}
+
+uint64_t selectedSize(const MapletHeader& hdr, uint32_t k) noexcept
+{
+    return BINARY_HEADER_SIZE + (static_cast<uint64_t>(k) * hdr.planeCells() * sizeof(double));
+}
+
+CodecStatus beginBandSelection(const int8_t* in, uint64_t inSize, uint32_t k, int8_t* out, uint64_t capacity) noexcept
+{
+    MapletHeader h;
+    if (const auto st = readPreamble(in, inSize, h); st != CodecStatus::Ok)
+    {
+        return st;
+    }
+    if (k == 0 || k > MAX_BANDS)
+    {
+        return CodecStatus::BandOutOfRange;
+    }
+    if (out == nullptr || capacity < selectedSize(h, k))
+    {
+        return CodecStatus::OutputTooSmall;
+    }
+    std::memcpy(out, in, BINARY_HEADER_SIZE);  // position, frame id, flags, raster size travel unchanged
+    out[2] = static_cast<int8_t>(k);
+    return CodecStatus::Ok;
+}
+
+CodecStatus copyBand(const int8_t* in, uint64_t inSize, uint32_t band, int8_t* out, uint64_t outSize, uint32_t slot) noexcept
+{
+    MapletHeader src;
+    if (const auto st = readPreamble(in, inSize, src); st != CodecStatus::Ok)
+    {
+        return st;
+    }
+    MapletHeader dst;
+    if (const auto st = readPreamble(out, outSize, dst); st != CodecStatus::Ok)
+    {
+        return st;  // not begun with beginBandSelection, or sized wrongly
+    }
+    if (dst.height != src.height || dst.width != src.width)
+    {
+        return CodecStatus::SizeMismatch;
+    }
+    if (band >= src.bands || slot >= dst.bands)
+    {
+        return CodecStatus::BandOutOfRange;
+    }
+    const uint64_t planeBytes = src.planeCells() * sizeof(double);
+    std::memcpy(out + BINARY_HEADER_SIZE + (slot * planeBytes), in + BINARY_HEADER_SIZE + (band * planeBytes), planeBytes);
+    return CodecStatus::Ok;
+}
+
+CodecStatus selectBands(const int8_t* in, uint64_t inSize, const uint8_t* idx, uint32_t k, int8_t* out, uint64_t capacity,
+                        uint64_t& bytesWritten) noexcept
+{
+    bytesWritten = 0;
+    if (idx == nullptr)
+    {
+        return CodecStatus::BandOutOfRange;
+    }
+    MapletHeader h;
+    if (const auto st = readPreamble(in, inSize, h); st != CodecStatus::Ok)
+    {
+        return st;
+    }
+    for (uint32_t i = 0; i < k; ++i)  // check every index before writing anything
+    {
+        if (idx[i] >= h.bands)
+        {
+            return CodecStatus::BandOutOfRange;
+        }
+    }
+    if (const auto st = beginBandSelection(in, inSize, k, out, capacity); st != CodecStatus::Ok)
+    {
+        return st;
+    }
+    const uint64_t need = selectedSize(h, k);
+    for (uint32_t i = 0; i < k; ++i)
+    {
+        if (const auto st = copyBand(in, inSize, idx[i], out, need, i); st != CodecStatus::Ok)
+        {
+            return st;
+        }
+    }
+    bytesWritten = need;
+    return CodecStatus::Ok;
+}
+
+CodecStatus setFrameId(int8_t* maplet, uint64_t size, uint32_t frameId) noexcept
+{
+    if (maplet == nullptr || size < BINARY_HEADER_SIZE)
+    {
+        return CodecStatus::TruncatedInput;
+    }
+    if (static_cast<uint8_t>(maplet[0]) != static_cast<uint8_t>(WireFormat::Binary))
+    {
+        return CodecStatus::UnsupportedVersion;
+    }
+    std::memcpy(maplet + OFFSET_FRAME_ID, &frameId, sizeof frameId);
+    return CodecStatus::Ok;
+}
+
+CodecStatus setFlags(int8_t* maplet, uint64_t size, uint8_t flags) noexcept
+{
+    if (maplet == nullptr || size < BINARY_HEADER_SIZE)
+    {
+        return CodecStatus::TruncatedInput;
+    }
+    if (static_cast<uint8_t>(maplet[0]) != static_cast<uint8_t>(WireFormat::Binary))
+    {
+        return CodecStatus::UnsupportedVersion;
+    }
+    maplet[OFFSET_FLAGS] = static_cast<int8_t>(flags);
+    return CodecStatus::Ok;
 }
 
 uint64_t encodedSizeBinary(const TileSpec& spec) noexcept

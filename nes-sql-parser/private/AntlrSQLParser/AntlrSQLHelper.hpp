@@ -29,7 +29,7 @@
 #include <Plans/LogicalPlan.hpp>
 #include <Sinks/SinkDescriptor.hpp>
 #include <WindowTypes/Types/TimeBasedWindowType.hpp>
-#include <Operators/Windows/WindowedFocalLogicalOperator.hpp>
+#include <Operators/Windows/WindowedFocalFrameLogicalOperator.hpp>
 
 #include <Functions/UnboundFieldAccessLogicalFunction.hpp>
 #include <Identifiers/Identifier.hpp>
